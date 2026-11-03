@@ -1121,8 +1121,12 @@ package body AHT.Transport.TLS is
             --  engine encrypts; the caller owns the read side.
             Status := Needs_Read;
          elsif Ret = M.ERR_WANT_WRITE then
-            --  Send_CB only refuses on allocation failure; the record
-            --  was not consumed, so the caller simply retries.
+            --  Not expected: Send_CB queues into memory and never
+            --  returns WANT_WRITE (its one failure, an allocation
+            --  error, comes back as NET_SEND_FAILED, which Engine_Call
+            --  classifies as fatal and raises before this point). The
+            --  engine's contract for it is a retry with the same
+            --  arguments, which is what Would_Block asks of the caller.
             Status := Would_Block;
          else
             Drop_Connection (St);

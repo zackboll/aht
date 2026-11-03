@@ -4,6 +4,7 @@
 with Ada.Calendar; use Ada.Calendar;
 with Ada.Command_Line;
 with Ada.Exceptions;
+with Ada.Real_Time;
 with Ada.Streams; use Ada.Streams;
 with Ada.Strings.Fixed;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
@@ -2127,8 +2128,9 @@ begin
             Fail ("try-write: chunk never completed");
          end if;
       end Send_Whole;
-      Expect  : AHT.Bytes.Octet := 0;
-      Drained : Natural := 0;
+      Expect   : AHT.Bytes.Octet := 0;
+      Drained  : Natural := 0;
+      Peer_EOF : Boolean := False;
       procedure Drain_Peer is
          Buf  : Stream_Element_Array (1 .. 65_536);
          Last : Stream_Element_Offset;
@@ -2144,7 +2146,10 @@ begin
                   end if;
                   exit;
             end;
-            exit when Last < Buf'First;
+            if Last < Buf'First then
+               Peer_EOF := True;
+               exit;
+            end if;
             for I in Buf'First .. Last loop
                if AHT.Bytes.Octet (Buf (I)) /= Expect then
                   Fail ("try-write: sequence broken at byte"
@@ -2156,6 +2161,32 @@ begin
             end loop;
          end loop;
       end Drain_Peer;
+      --  Bytes the socket accepted are in flight, not yet readable
+      --  by the peer; drain repeatedly until Expected have arrived or
+      --  a deadline passes. The deadline only bounds the wait: a
+      --  count still short when it expires is the failure. Sequence
+      --  errors are reported by Drain_Peer as they are seen, and a
+      --  socket error or an EOF before the count is reached ends the
+      --  wait at once rather than being retried into the deadline.
+      procedure Drain_Until (Expected : Natural; What : String) is
+         use type Ada.Real_Time.Time;
+         Deadline : constant Ada.Real_Time.Time :=
+           Ada.Real_Time.Clock + Ada.Real_Time.Seconds (5);
+      begin
+         loop
+            Drain_Peer;
+            exit when Drained >= Expected or else Peer_EOF;
+            exit when Ada.Real_Time.Clock >= Deadline;
+            delay 0.001;
+         end loop;
+         if Drained /= Expected then
+            Fail ("try-write: " & What & " the peer saw" & Drained'Image
+                  & " of" & Expected'Image & " bytes"
+                  & (if Peer_EOF then " before EOF"
+                     elsif Drained < Expected then " before the deadline"
+                     else ""));
+         end if;
+      end Drain_Until;
       Nonblocking : Request_Type := (Non_Blocking_IO, True);
    begin
       Create_Socket (Listener, Family_Inet, Socket_Stream);
@@ -2206,11 +2237,7 @@ begin
                   & "full window (" & Sent_Total'Image & " bytes)");
          end if;
          --  Drain, then resume exactly where the short send stopped.
-         Drain_Peer;
-         if Drained /= Sent_Total then
-            Fail ("try-write: peer saw" & Drained'Image & " of"
-                  & Sent_Total'Image & " accepted bytes");
-         end if;
+         Drain_Until (Sent_Total, "after the full window");
          while Pos <= Data'Last loop
             T.Try_Write (Data (Pos .. Data'Last), Count);
             Pos := Pos + Count;
@@ -2223,12 +2250,7 @@ begin
       Fill;
       Send_Whole;
       Sent_Total := Sent_Total + Chunk;
-      delay 0.05;
-      Drain_Peer;
-      if Drained /= Sent_Total then
-         Fail ("try-write: after resume the peer saw" & Drained'Image
-               & " of" & Sent_Total'Image & " bytes");
-      end if;
+      Drain_Until (Sent_Total, "after resume");
       if not T.Is_Connected then
          Fail ("try-write: would-block poisoned the transport");
       end if;
