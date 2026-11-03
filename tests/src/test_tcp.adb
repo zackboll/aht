@@ -2083,6 +2083,191 @@ begin
          Free (Big);
    end;
 
+   --  Case 18: Try_Write never parks. Against a peer that reads, a
+   --  small send is accepted whole; against one that does not, with a
+   --  tiny receive buffer, repeated sends fill the window and the call
+   --  reports 0 instead of blocking. Once the peer drains, resuming
+   --  from Count delivers every byte once, in order (the peer checks
+   --  the sequence). A peer reset then poisons, as Write would.
+   declare
+      use type AHT.Bytes.Octet;
+      Listener : Socket_Type := No_Socket;
+      Peer     : Socket_Type := No_Socket;
+      From     : Sock_Addr_Type;
+      Bind_To  : Sock_Addr_Type;
+      T        : AHT.Transport.TCP.TCP_Transport;
+      Chunk    : constant := 4096;
+      Data     : AHT.Bytes.Byte_Array (1 .. Chunk);
+      Count    : Natural;
+      Started  : Time;
+      Blocked  : Boolean := False;
+      Sent_Total : Natural := 0;
+      Next_Seq : AHT.Bytes.Octet := 0;
+      --  Each byte carries a running sequence number so the peer can
+      --  tell a duplicate or a gap from a correct resume.
+      procedure Fill is
+      begin
+         for I in Data'Range loop
+            Data (I) := Next_Seq;
+            Next_Seq := Next_Seq + 1;
+         end loop;
+      end Fill;
+      --  Send one chunk to completion, resuming from Count after each
+      --  short send; the peer must be draining for this to finish.
+      procedure Send_Whole is
+         Pos : Natural := Data'First;
+      begin
+         for I in 1 .. 10_000 loop
+            T.Try_Write (Data (Pos .. Data'Last), Count);
+            Pos := Pos + Count;
+            exit when Pos > Data'Last;
+            delay 0.001;
+         end loop;
+         if Pos <= Data'Last then
+            Fail ("try-write: chunk never completed");
+         end if;
+      end Send_Whole;
+      Expect  : AHT.Bytes.Octet := 0;
+      Drained : Natural := 0;
+      procedure Drain_Peer is
+         Buf  : Stream_Element_Array (1 .. 65_536);
+         Last : Stream_Element_Offset;
+      begin
+         loop
+            begin
+               Receive_Socket (Peer, Buf, Last);
+            exception
+               when E : Socket_Error =>
+                  if Resolve_Exception (E) /= Resource_Temporarily_Unavailable
+                  then
+                     raise;
+                  end if;
+                  exit;
+            end;
+            exit when Last < Buf'First;
+            for I in Buf'First .. Last loop
+               if AHT.Bytes.Octet (Buf (I)) /= Expect then
+                  Fail ("try-write: sequence broken at byte"
+                        & Drained'Image);
+                  Expect := AHT.Bytes.Octet (Buf (I));
+               end if;
+               Expect := Expect + 1;
+               Drained := Drained + 1;
+            end loop;
+         end loop;
+      end Drain_Peer;
+      Nonblocking : Request_Type := (Non_Blocking_IO, True);
+   begin
+      Create_Socket (Listener, Family_Inet, Socket_Stream);
+      Set_Socket_Option
+        (Listener, Socket_Level, (Name => Receive_Buffer, Size => 2048));
+      Bind_To.Addr := Inet_Addr ("127.0.0.1");
+      Bind_To.Port := 0;
+      Bind_Socket (Listener, Bind_To);
+      Listen_Socket (Listener, 1);
+      T.Connect
+        ("127.0.0.1",
+         AHT.URL.Port_Number (Get_Socket_Name (Listener).Port));
+      Accept_Socket (Listener, Peer, From);
+      Control_Socket (Peer, Nonblocking);
+
+      --  A small first send goes in whole: the window is empty.
+      Fill;
+      T.Try_Write (Data (1 .. 16), Count);
+      if Count /= 16 then
+         Fail ("try-write: idle socket accepted" & Count'Image & " of 16");
+      end if;
+      Sent_Total := Count;
+      --  The rest of this chunk and more, until the window is full:
+      --  the peer is not reading. Each call must return at once.
+      declare
+         Pos : Natural := 17;
+      begin
+         for I in 1 .. 10_000 loop
+            if Pos > Data'Last then
+               Fill;
+               Pos := Data'First;
+            end if;
+            Started := Clock;
+            T.Try_Write (Data (Pos .. Data'Last), Count);
+            if Clock - Started > 0.5 then
+               Fail ("try-write: a call took "
+                     & Duration'Image (Clock - Started) & " s");
+            end if;
+            Sent_Total := Sent_Total + Count;
+            Pos := Pos + Count;
+            if Count = 0 then
+               Blocked := True;
+               exit;
+            end if;
+         end loop;
+         if not Blocked then
+            Fail ("try-write: never reported would-block against a "
+                  & "full window (" & Sent_Total'Image & " bytes)");
+         end if;
+         --  Drain, then resume exactly where the short send stopped.
+         Drain_Peer;
+         if Drained /= Sent_Total then
+            Fail ("try-write: peer saw" & Drained'Image & " of"
+                  & Sent_Total'Image & " accepted bytes");
+         end if;
+         while Pos <= Data'Last loop
+            T.Try_Write (Data (Pos .. Data'Last), Count);
+            Pos := Pos + Count;
+            Sent_Total := Sent_Total + Count;
+            if Count = 0 then
+               Drain_Peer;
+            end if;
+         end loop;
+      end;
+      Fill;
+      Send_Whole;
+      Sent_Total := Sent_Total + Chunk;
+      delay 0.05;
+      Drain_Peer;
+      if Drained /= Sent_Total then
+         Fail ("try-write: after resume the peer saw" & Drained'Image
+               & " of" & Sent_Total'Image & " bytes");
+      end if;
+      if not T.Is_Connected then
+         Fail ("try-write: would-block poisoned the transport");
+      end if;
+
+      --  Peer gone: the failure poisons rather than reporting 0.
+      Set_Socket_Option
+        (Peer, Socket_Level, (Name => Linger, Enabled => True, Seconds => 0));
+      Close_Peer_Quietly (Peer);
+      delay 0.05;
+      declare
+         Raised : Boolean := False;
+      begin
+         for I in 1 .. 10 loop
+            begin
+               T.Try_Write (Data, Count);
+            exception
+               when AHT.Transport.Transport_Error =>
+                  Raised := True;
+                  exit;
+            end;
+            delay 0.01;
+         end loop;
+         if not Raised then
+            Fail ("try-write: no Transport_Error after the peer reset");
+         elsif T.Is_Connected then
+            Fail ("try-write: still connected after the fatal send");
+         end if;
+      end;
+      Close_Quietly (T);
+      Close_Peer_Quietly (Listener);
+   exception
+      when E : others =>
+         Fail ("try-write: " & Ada.Exceptions.Exception_Name (E) & " — "
+               & Ada.Exceptions.Exception_Message (E));
+         Close_Quietly (T);
+         Close_Peer_Quietly (Peer);
+         Close_Peer_Quietly (Listener);
+   end;
+
    if Failures = 0 then
       Put_Line ("test_tcp: OK");
       Ada.Command_Line.Set_Exit_Status (0);

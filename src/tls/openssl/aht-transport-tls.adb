@@ -85,6 +85,15 @@ package body AHT.Transport.TLS is
       --  SSL_ERROR_SSL/SSL_ERROR_SYSCALL or a failed drain; OpenSSL
       --  forbids further I/O after a fatal result, so every engine
       --  call checks it first. The reason names the original failure.
+
+      Staged : AHT.Bytes.Buffer;
+      --  Ciphertext taken out of WBIO (BIO_read is destructive) that
+      --  the socket has not accepted yet: what a Try_Flush or
+      --  Try_Write could not send. Older than anything still in WBIO,
+      --  so every drain ships it first. Contents guarded by SSL_Lock
+      --  (Engine_Call counts it as pending output); only a Drain_Lock
+      --  holder moves bytes in or out, which keeps wire order. At most
+      --  Chunk_Max bytes: a drain stages one chunk at a time.
    end record;
 
    procedure Free_TCP is new Ada.Unchecked_Deallocation
@@ -183,9 +192,37 @@ package body AHT.Transport.TLS is
    --  Phase B: drain WBIO ciphertext to the wire
    ---------------------------------------------------------------
 
+   --  Move up to Chunk_Max bytes of WBIO ciphertext into Staged when
+   --  Staged is empty. Caller holds SSL_Lock. A BIO_read failure with
+   --  bytes pending is an engine fault, reported by the caller.
+   procedure Stage_From_Engine
+     (St : Backend_State_Access; Failed : out Boolean)
+   is
+      Buf     : AHT.Bytes.Byte_Array (1 .. Chunk_Max);
+      Pending : C.size_t;
+      Got     : C.int;
+   begin
+      Failed := False;
+      if not St.Staged.Is_Empty then
+         return;
+      end if;
+      Pending := OBIO.Ctrl_Pending (St.WBio);
+      if Pending = 0 then
+         return;
+      end if;
+      Got := OBIO.Read
+        (St.WBio, Buf'Address, C.int (C.size_t'Min (Pending, Chunk_Max)));
+      if Got <= 0 then
+         Failed := True;
+         return;
+      end if;
+      St.Staged.Set (Buf (1 .. Natural (Got)));
+   end Stage_From_Engine;
+
    --  Drain everything pending in WBIO to the TCP transport, in wire
-   --  order (extraction happens under Drain_Lock). Bounded by the
-   --  calling operation's deadline. Any failure here is fail-closed:
+   --  order (extraction happens under Drain_Lock), after whatever an
+   --  earlier nonblocking push left in Staged. Bounded by the calling
+   --  operation's deadline. Any failure here is fail-closed:
    --  ciphertext may be half-sent, so the engine is dead and the
    --  session poisoned before the exception propagates.
    procedure Drain_Output
@@ -194,31 +231,29 @@ package body AHT.Transport.TLS is
       Epoch0 : Epoch_Type;
       Where  : String)
    is
-      Buf : AHT.Bytes.Byte_Array (1 .. Chunk_Max);
-      Got : C.int;
+      Failed : Boolean;
    begin
       Seize (St.Drain_Lock, St, DL, Epoch0, Where, "output drain lock");
       begin
          loop
             Seize (St.SSL_Lock, St, DL, Epoch0, Where, "engine lock");
-            declare
-               Pending : constant C.size_t :=
-                 OBIO.Ctrl_Pending (St.WBio);
-            begin
-               if Pending = 0 then
-                  St.SSL_Lock.Release;
-                  exit;
-               end if;
-               Got := OBIO.Read
-                 (St.WBio, Buf'Address,
-                  C.int (C.size_t'Min (Pending, Chunk_Max)));
-            end;
-            St.SSL_Lock.Release;
-            if Got <= 0 then
+            Stage_From_Engine (St, Failed);
+            if Failed then
+               St.SSL_Lock.Release;
                raise TLS_Error
                  with Where & ": BIO_read from output BIO failed";
             end if;
-            St.TCP.Write (Buf (1 .. Natural (Got)), Deadline => DL);
+            if St.Staged.Is_Empty then
+               St.SSL_Lock.Release;
+               exit;
+            end if;
+            declare
+               Slice : constant AHT.Bytes.Byte_Array := St.Staged.To_Array;
+            begin
+               St.Staged.Clear;
+               St.SSL_Lock.Release;
+               St.TCP.Write (Slice, Deadline => DL);
+            end;
          end loop;
       exception
          when E : others =>
@@ -232,6 +267,68 @@ package body AHT.Transport.TLS is
       end;
       St.Drain_Lock.Release;
    end Drain_Output;
+
+   --  The nonblocking drain: stage, push with TCP.Try_Write, repeat
+   --  until nothing is pending (Flushed) or the socket refuses some
+   --  of it (Would_Block, the rest kept in Staged). Caller has checked
+   --  Live and holds the exclusive-I/O precondition, so the locks are
+   --  uncontended and seized without a deadline. Failure is
+   --  fail-closed, as in Drain_Output.
+   procedure Push_Output
+     (St     : Backend_State_Access;
+      Where  : String;
+      Status : out Try_Flush_Status)
+   is
+      Failed : Boolean;
+      Count  : Natural;
+   begin
+      Status := Flushed;
+      St.Drain_Lock.Seize;
+      begin
+         loop
+            St.SSL_Lock.Seize;
+            Stage_From_Engine (St, Failed);
+            if Failed then
+               St.SSL_Lock.Release;
+               raise TLS_Error
+                 with Where & ": BIO_read from output BIO failed";
+            end if;
+            if St.Staged.Is_Empty then
+               St.SSL_Lock.Release;
+               exit;
+            end if;
+            declare
+               Chunk : constant AHT.Bytes.Byte_Array := St.Staged.To_Array;
+            begin
+               St.SSL_Lock.Release;
+               St.TCP.Try_Write (Chunk, Count);
+               --  Nothing else appends to Staged while Drain_Lock is
+               --  held, so Chunk is still exactly its contents.
+               St.SSL_Lock.Seize;
+               if Count = Chunk'Length then
+                  St.Staged.Clear;
+               else
+                  St.Staged.Set (Chunk (Count + 1 .. Chunk'Last));
+               end if;
+               St.SSL_Lock.Release;
+               if Count < Chunk'Length then
+                  Status := Would_Block;
+                  exit;
+               end if;
+            end;
+         end loop;
+      exception
+         when E : others =>
+            St.Drain_Lock.Release;
+            Latch_Engine_Dead
+              (St, Where & " push failed: "
+               & Ada.Exceptions.Exception_Name (E) & " - "
+               & Ada.Exceptions.Exception_Message (E));
+            Drop_Connection (St);
+            raise;
+      end;
+      St.Drain_Lock.Release;
+   end Push_Output;
 
    ---------------------------------------------------------------
    --  Feed: get more inbound ciphertext into RBIO (or wait for it)
@@ -433,7 +530,9 @@ package body AHT.Transport.TLS is
                else Fatal_Msg.To_String));
       end if;
 
-      Pending := Natural (OBIO.Ctrl_Pending (St.WBio));
+      --  Staged counts too: a blocking operation after a nonblocking
+      --  one must ship what the socket refused before its own output.
+      Pending := Natural (OBIO.Ctrl_Pending (St.WBio)) + St.Staged.Length;
       St.SSL_Lock.Release;
 
       if Is_Fatal then
@@ -897,6 +996,111 @@ package body AHT.Transport.TLS is
       end;
    end Try_Read;
 
+   procedure Try_Flush
+     (Self   : in out TLS_Transport;
+      Status : out Try_Flush_Status) is
+   begin
+      if not Live (Self) then
+         raise AHT.Transport.Transport_Error
+           with "TLS write on closed transport";
+      end if;
+      Push_Output (Self.State, "TLS try-flush", Status);
+   end Try_Flush;
+
+   function Pending_Output (Self : TLS_Transport) return Natural is
+      St    : constant Backend_State_Access := Self.State;
+      Total : Natural;
+   begin
+      if St = null or else St.SSL = System.Null_Address then
+         return 0;
+      end if;
+      St.SSL_Lock.Seize;
+      Total := Natural (OBIO.Ctrl_Pending (St.WBio)) + St.Staged.Length;
+      St.SSL_Lock.Release;
+      return Total;
+   end Pending_Output;
+
+   procedure Try_Write
+     (Self   : in out TLS_Transport;
+      Data   : AHT.Bytes.Byte_Array;
+      Count  : out Natural;
+      Status : out Try_Write_Status)
+   is
+      Try_Write_Max : constant := 16_384;
+      --  One TLS record's worth of plaintext, so the ciphertext a
+      --  refusing socket leaves behind is one record, not Data.
+      St    : Backend_State_Access;
+      Flush : Try_Flush_Status;
+   begin
+      Count  := 0;
+      Status := Accepted;
+      if not Live (Self) then
+         raise AHT.Transport.Transport_Error
+           with "TLS write on closed transport";
+      end if;
+      St := Self.State;
+
+      --  Backpressure first: nothing new goes into the engine on top
+      --  of ciphertext the socket has not taken.
+      Push_Output (St, "TLS try-write", Flush);
+      if Flush = Would_Block then
+         Status := Would_Block;
+         return;
+      end if;
+      if Data'Length = 0 then
+         return;
+      end if;
+
+      declare
+         Epoch0  : constant Epoch_Type := St.Coord.Abort_Epoch;
+         Len     : constant Natural :=
+           Natural'Min (Data'Length, Try_Write_Max);
+         Ret     : C.int;
+         Class   : C.int;
+         Pending : Natural;
+      begin
+         Engine_Call
+           (St, Op_Write, Data (Data'First)'Address, C.int (Len),
+            Ada.Real_Time.Time_Last, Epoch0, "TLS try-write",
+            Ret, Class, Pending);
+         if Ret > 0 then
+            if St.Coord.Fatal then
+               raise TLS_Error
+                 with "TLS try-write: session failed concurrently";
+            end if;
+            Count := Natural (Ret);
+         elsif Class = OSSL.ERROR_WANT_READ then
+            --  A post-handshake message must be read before the
+            --  engine encrypts; the caller owns the read side.
+            Status := Needs_Read;
+         else
+            Latch_Engine_Dead
+              (St, "TLS try-write: unexpected engine state (class"
+               & C.int'Image (Class) & ")");
+            Drop_Connection (St);
+            raise TLS_Error
+              with "TLS try-write: unexpected engine state (class"
+                & C.int'Image (Class) & ")";
+         end if;
+         --  Ship what the call produced (the record, or a reply the
+         --  engine queued on the way to WANT_READ); a refusal keeps it
+         --  staged and is reported by the next call's backpressure.
+         if Pending > 0 then
+            Push_Output (St, "TLS try-write", Flush);
+         end if;
+      exception
+         when E : TLS_Error | AHT.Transport.Transport_Error =>
+            --  Fail-closed, as in Write: SSL_write may have consumed
+            --  plaintext whose ciphertext cannot be shipped.
+            Latch_Engine_Dead
+              (St, "TLS try-write failed: "
+               & Ada.Exceptions.Exception_Name (E) & " - "
+               & Ada.Exceptions.Exception_Message (E));
+            Drop_Connection (St);
+            raise;
+      end;
+   end Try_Write;
+
    overriding procedure Read
      (Self : in out TLS_Transport;
       Data : out AHT.Bytes.Byte_Array;
@@ -1075,21 +1279,20 @@ package body AHT.Transport.TLS is
             Ignore := OSSL.Shutdown (St.SSL);
             if Ignore >= 0 then
                declare
-                  Buf : AHT.Bytes.Byte_Array (1 .. Chunk_Max);
-                  Got : C.int;
+                  Failed : Boolean;
                begin
+                  --  Staged first, then the close_notify behind it:
+                  --  the same order Drain_Output keeps.
                   loop
+                     Stage_From_Engine (St, Failed);
+                     exit when Failed or else St.Staged.Is_Empty;
                      declare
-                        Pending : constant C.size_t :=
-                          OBIO.Ctrl_Pending (St.WBio);
+                        Slice : constant AHT.Bytes.Byte_Array :=
+                          St.Staged.To_Array;
                      begin
-                        exit when Pending = 0;
-                        Got := OBIO.Read
-                          (St.WBio, Buf'Address,
-                           C.int (C.size_t'Min (Pending, Chunk_Max)));
+                        St.Staged.Clear;
+                        St.TCP.Write (Slice);
                      end;
-                     exit when Got <= 0;
-                     St.TCP.Write (Buf (1 .. Natural (Got)));
                   end loop;
                end;
             end if;

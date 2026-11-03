@@ -176,6 +176,15 @@ affect it.
 parking on the write selector until the socket is writable and
 checking the write deadline on each pass.
 
+`Try_Read` and `Try_Write` are the single receive and the single send
+of those loops without the park: the socket is non-blocking, so
+`EAGAIN` is reported as `Would_Block` or a `Count` of 0 rather than
+waited out. Neither consults the deadlines or `Abort_Pending`, there
+being no wait to bound. `Try_Write` accepts at most 64 KiB per call
+and leaves the rest to the caller; a peer that accepts zero bytes
+while reporting writable, or any other error, poisons as `Write`
+does. The TLS backends build their nonblocking operations on these.
+
 `Read` and `Write` also have deadline-explicit overloads taking an
 absolute `Ada.Real_Time.Time`. They bound that one call by that
 instant and ignore the compound deadlines; everything else, including
@@ -282,12 +291,23 @@ Handshake_Deadline, CA_PEM, Resolve_Timeout)`:
 - `Insecure => True` skips certificate verification.
 
 `Close` is a best-effort close_notify (skipped when the session died
-of a fatal error), then `TCP.Close`, then unconditional freeing of
-the backend contexts; idempotent. Its precondition is the TCP one
+of a fatal error), preceded by any ciphertext the nonblocking
+operations left pending, then `TCP.Close`, then unconditional
+freeing of the backend contexts; idempotent. Its precondition is the TCP one
 extended to the whole object: `Close` frees the state that
 `Is_Connected`, the deadline setters and `Abort_Pending` dereference,
 so no other task may be inside any operation while it runs. See
 *The `Close` precondition* in [`tls.md`](tls.md).
+
+`Try_Read`, `Try_Flush`, `Try_Write` and `Pending_Output` serve a
+caller that multiplexes the connection in its own loop and never
+waits inside the transport: `Try_Read` decrypts what is buffered plus
+one non-blocking receive; `Try_Write` hands the engine up to one
+record of plaintext and reports how much it took; `Try_Flush` pushes
+queued ciphertext, including replies the engine generated during
+`Try_Read`, with one non-blocking send at a time and keeps the
+remainder for the next call. How the queue is kept in order with the
+blocking operations is under *The engine* in [`tls.md`](tls.md).
 
 `Is_Connected` is true after a successful `Connect` until `Close`,
 except that a session poisoned by a fatal `Read`/`Write` reports

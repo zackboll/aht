@@ -19,8 +19,9 @@
 # 8767 stall, 8768 wss echo, 8769 deaf TLS, 8771 abrupt close, 8773
 # corrupted record, 8774/8775 invalid or dribbled handshake, 8776
 # concurrent corruption, 8777 hostile WebSocket peer, 8778 fragmented
-# record, 8770 go-httpbin (optional; test_httpbin SKIPs without it).
-# test_tls_keyupdate starts its own s_server on 8772.
+# record, 8779 backpressure sink, 8770 go-httpbin (optional;
+# test_httpbin SKIPs without it). test_tls_keyupdate starts its own
+# s_server on 8772, test_tls_try_write on 8780.
 
 set -eu
 
@@ -96,6 +97,7 @@ WSS_PID=
 TLSDEAF_PID=
 TLSABRUPT_PID=
 TLSFRAGMENT_PID=
+TLSSINK_PID=
 TLSCORRUPT_PID=
 TLSBADHS_PID=
 TLSCONC_PID=
@@ -134,6 +136,10 @@ cleanup() {
     if [ -n "$TLSFRAGMENT_PID" ]; then
         kill "$TLSFRAGMENT_PID" 2>/dev/null || true
         wait "$TLSFRAGMENT_PID" 2>/dev/null || true
+    fi
+    if [ -n "$TLSSINK_PID" ]; then
+        kill "$TLSSINK_PID" 2>/dev/null || true
+        wait "$TLSSINK_PID" 2>/dev/null || true
     fi
     if [ -n "$TLSCORRUPT_PID" ]; then
         kill "$TLSCORRUPT_PID" 2>/dev/null || true
@@ -195,7 +201,7 @@ PY="$VENV"/bin/python3
 echo "==> generating self-signed test cert"
 sh scripts/generate_cert.sh
 
-echo "==> starting HTTP (8764) + WS (8765) + TLS (8766) + stall (8767) + wss (8768) + tlsdeaf (8769) + tlsabrupt (8771) + tlscorrupt (8773) + tlsbadhandshake (8774+8775) + tlsconcurrent (8776) + wshostile (8777) + tlsfragment (8778) fixtures"
+echo "==> starting HTTP (8764) + WS (8765) + TLS (8766) + stall (8767) + wss (8768) + tlsdeaf (8769) + tlsabrupt (8771) + tlscorrupt (8773) + tlsbadhandshake (8774+8775) + tlsconcurrent (8776) + wshostile (8777) + tlsfragment (8778) + tlssink (8779) fixtures"
 "$PY" tests/server/server.py          >>"$LOG" 2>&1 &
 HTTP_PID=$!
 "$PY" tests/server/server_ws.py       >>"$LOG" 2>&1 &
@@ -212,6 +218,8 @@ TLSDEAF_PID=$!
 TLSABRUPT_PID=$!
 "$PY" tests/server/server_tls_fragment.py >>"$LOG" 2>&1 &
 TLSFRAGMENT_PID=$!
+"$PY" tests/server/server_tls_sink.py >>"$LOG" 2>&1 &
+TLSSINK_PID=$!
 "$PY" tests/server/server_tls_corrupt.py >>"$LOG" 2>&1 &
 TLSCORRUPT_PID=$!
 "$PY" tests/server/server_tls_badhandshake.py >>"$LOG" 2>&1 &
@@ -232,6 +240,7 @@ for _ in $(seq 1 50); do
     HAS_TLSDEAF=$(grep -c '^READY tlsdeaf ' "$LOG" 2>/dev/null || true)
     HAS_TLSABRUPT=$(grep -c '^READY tlsabrupt ' "$LOG" 2>/dev/null || true)
     HAS_TLSFRAGMENT=$(grep -c '^READY tlsfragment ' "$LOG" 2>/dev/null || true)
+    HAS_TLSSINK=$(grep -c '^READY tlssink ' "$LOG" 2>/dev/null || true)
     HAS_TLSCORRUPT=$(grep -c '^READY tlscorrupt ' "$LOG" 2>/dev/null || true)
     HAS_TLSBADHS=$(grep -c '^READY tlsbadhandshake ' "$LOG" 2>/dev/null || true)
     HAS_TLSCONC=$(grep -c '^READY tlsconcurrent ' "$LOG" 2>/dev/null || true)
@@ -240,7 +249,7 @@ for _ in $(seq 1 50); do
        && [ "$HAS_TLS" -ge 1 ] && [ "$HAS_STALL" -ge 1 ] \
        && [ "$HAS_WSS" -ge 1 ] && [ "$HAS_TLSDEAF" -ge 1 ] \
        && [ "$HAS_TLSABRUPT" -ge 1 ] && [ "$HAS_TLSFRAGMENT" -ge 1 ] \
-       && [ "$HAS_TLSCORRUPT" -ge 1 ] \
+       && [ "$HAS_TLSSINK" -ge 1 ] && [ "$HAS_TLSCORRUPT" -ge 1 ] \
        && [ "$HAS_TLSBADHS" -ge 1 ] && [ "$HAS_TLSCONC" -ge 1 ] \
        && [ "$HAS_WSHOSTILE" -ge 1 ]; then
         break
@@ -258,6 +267,7 @@ HAS_WSS=$(grep -c     '^READY wss '     "$LOG" 2>/dev/null || true)
 HAS_TLSDEAF=$(grep -c '^READY tlsdeaf ' "$LOG" 2>/dev/null || true)
 HAS_TLSABRUPT=$(grep -c '^READY tlsabrupt ' "$LOG" 2>/dev/null || true)
 HAS_TLSFRAGMENT=$(grep -c '^READY tlsfragment ' "$LOG" 2>/dev/null || true)
+HAS_TLSSINK=$(grep -c '^READY tlssink ' "$LOG" 2>/dev/null || true)
 HAS_TLSCORRUPT=$(grep -c '^READY tlscorrupt ' "$LOG" 2>/dev/null || true)
 HAS_TLSBADHS=$(grep -c '^READY tlsbadhandshake ' "$LOG" 2>/dev/null || true)
 HAS_TLSCONC=$(grep -c '^READY tlsconcurrent ' "$LOG" 2>/dev/null || true)
@@ -266,7 +276,7 @@ if [ "$HAS_HTTP" -lt 1 ] || [ "$HAS_WS" -lt 1 ] \
    || [ "$HAS_TLS" -lt 1 ] || [ "$HAS_STALL" -lt 1 ] \
    || [ "$HAS_WSS" -lt 1 ] || [ "$HAS_TLSDEAF" -lt 1 ] \
    || [ "$HAS_TLSABRUPT" -lt 1 ] || [ "$HAS_TLSFRAGMENT" -lt 1 ] \
-   || [ "$HAS_TLSCORRUPT" -lt 1 ] \
+   || [ "$HAS_TLSSINK" -lt 1 ] || [ "$HAS_TLSCORRUPT" -lt 1 ] \
    || [ "$HAS_TLSBADHS" -lt 1 ] || [ "$HAS_TLSCONC" -lt 1 ] \
    || [ "$HAS_WSHOSTILE" -lt 1 ]
 then
@@ -274,6 +284,7 @@ then
     echo "ws=$HAS_WS tls=$HAS_TLS stall=$HAS_STALL wss=$HAS_WSS"
     echo "tlsdeaf=$HAS_TLSDEAF tlsabrupt=$HAS_TLSABRUPT"
     echo "tlsfragment=$HAS_TLSFRAGMENT"
+    echo "tlssink=$HAS_TLSSINK"
     echo "tlscorrupt=$HAS_TLSCORRUPT tlsbadhs=$HAS_TLSBADHS"
     echo "tlsconc=$HAS_TLSCONC wshostile=$HAS_WSHOSTILE); log follows:"
     cat "$LOG"

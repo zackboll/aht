@@ -106,6 +106,20 @@ package AHT.Transport.TCP is
    --  interruptible by Abort_Pending. Empty Data: Would_Block.
    --  Occupies the reader role of the concurrency contract above.
 
+   procedure Try_Write
+     (Self  : in out TCP_Transport;
+      Data  : AHT.Bytes.Byte_Array;
+      Count : out Natural);
+   --  One send on the non-blocking socket, without parking on the
+   --  write selector: Count is how many leading bytes of Data the
+   --  kernel accepted, 0 when it would block (or Data is empty). The
+   --  rest is the caller's to retry; nothing is queued here. A peer
+   --  that accepts zero bytes while reporting writable, or any error
+   --  other than would-block, poisons the transport and raises
+   --  Transport_Error, as Write does. Ignores Set_Write_Deadline and
+   --  Abort_Pending (there is no wait to bound). Occupies the writer
+   --  role of the concurrency contract above.
+
    overriding function Is_Connected (Self : TCP_Transport) return Boolean;
 
    overriding procedure Set_Read_Deadline

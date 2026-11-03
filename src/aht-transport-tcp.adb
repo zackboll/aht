@@ -707,6 +707,48 @@ package body AHT.Transport.TCP is
          end if;
    end Try_Read;
 
+   procedure Try_Write
+     (Self  : in out TCP_Transport;
+      Data  : AHT.Bytes.Byte_Array;
+      Count : out Natural)
+   is
+      Try_Write_Max : constant := 65_536;
+      --  Same fixed window as Write_Bounded: Data may be a multi-MB
+      --  frame and the staging array lives on the primary stack.
+      Window : constant Natural := Natural'Min (Data'Length, Try_Write_Max);
+      Buffer : Stream_Element_Array (1 .. Stream_Element_Offset (Window));
+      Sent   : Stream_Element_Offset;
+   begin
+      Count := 0;
+      if Data'Length = 0 then
+         return;
+      end if;
+      if not Self.Connected then
+         raise Transport_Error with "TCP write on closed transport";
+      end if;
+      To_SEA (Data (Data'First .. Data'First + Window - 1), Buffer);
+      --  The send Write_Bounded performs after its selector wake, minus
+      --  the park: EAGAIN is "no room yet", not an error.
+      begin
+         Send_Socket (Self.Socket, Buffer, Sent);
+      exception
+         when E : Socket_Error =>
+            if Resolve_Exception (E) = Resource_Temporarily_Unavailable then
+               return;
+            end if;
+            Poison (Self);
+            raise Transport_Error with
+              "TCP write failed: " & Ada.Exceptions.Exception_Message (E);
+      end;
+      if Sent < Buffer'First then
+         --  Zero accepted without EAGAIN is GNAT's closed-peer signal
+         --  (see Write_Bounded); retrying would spin.
+         Poison (Self);
+         raise Transport_Error with "TCP write: peer closed connection";
+      end if;
+      Count := Natural (Sent);
+   end Try_Write;
+
    overriding procedure Close (Self : in out TCP_Transport) is
    begin
       --  Guard on the FD, not Connected: a poisoned transport has already
