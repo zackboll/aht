@@ -170,6 +170,9 @@ if [ "$AHT_OS" = "posix" ]; then
     alr build
     echo "==> building tests"
     alr exec -- gprbuild -P tests/tests.gpr
+    # Separate project: it links a test-only System.Memory body
+    # (allocation-failure injection) that must stay out of the others.
+    alr exec -- gprbuild -P tests/fault/fault.gpr
 else
     # Alire drives the native toolchain, so the cross build goes
     # straight to gprbuild and runs the pre-build action by hand; it
@@ -326,6 +329,11 @@ NAMES=$(grep -oE '"test_[a-z0-9_]+\.adb"' tests/tests.gpr \
 if [ -z "$NAMES" ]; then
     echo "FATAL: could not parse any test mains from tests/tests.gpr"
     exit 2
+fi
+# The fault-injection main is native only (its System.Memory body is
+# written for the native run-time); it runs last, after the suite.
+if [ "$AHT_OS" = "posix" ]; then
+    NAMES="$NAMES test_tls_staging_fault"
 fi
 
 # Per-test wall-clock cap: a deadlocked test would hide every test

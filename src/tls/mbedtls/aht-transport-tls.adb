@@ -268,10 +268,58 @@ package body AHT.Transport.TLS is
       St.SSL_Lock.Seize;
       if not St.Engine_Dead then
          St.Engine_Dead := True;
-         St.Death_Reason.Set (Reason);
+         begin
+            St.Death_Reason.Set (Reason);
+         exception
+            when others => null;  --  flag set; the lock must be released
+         end;
       end if;
       St.SSL_Lock.Release;
    end Latch_Engine_Dead;
+
+   --  Fail-closed cleanup shared by the Drain_Output and Push_Output
+   --  handlers; Drain_Lock is held on entry. Held says whether the
+   --  exception left SSL_Lock held too (the staging steps allocate
+   --  under it): then the engine is marked dead in place and the lock
+   --  released, never re-seized through Latch_Engine_Dead, which would
+   --  wait on the lock this task owns. The flag is set before the
+   --  reason is built, and the reason is best effort: the failure
+   --  being cleaned up may be an allocation failure, and a second one
+   --  must leave neither the engine live nor a lock held.
+   procedure Fail_Output
+     (St    : Backend_State_Access;
+      Held  : Boolean;
+      Where : String;
+      What  : String;
+      E     : Ada.Exceptions.Exception_Occurrence)
+   is
+      procedure Mark is
+      begin
+         if not St.Engine_Dead then
+            St.Engine_Dead := True;
+            begin
+               St.Death_Reason.Set
+                 (Where & " " & What & " failed: "
+                  & Ada.Exceptions.Exception_Name (E) & " - "
+                  & Ada.Exceptions.Exception_Message (E));
+            exception
+               when others => null;
+            end;
+         end if;
+      end Mark;
+   begin
+      if Held then
+         Mark;
+         St.SSL_Lock.Release;
+         St.Drain_Lock.Release;
+      else
+         St.Drain_Lock.Release;
+         St.SSL_Lock.Seize;
+         Mark;
+         St.SSL_Lock.Release;
+      end if;
+      Drop_Connection (St);
+   end Fail_Output;
 
    function Live (Self : TLS_Transport) return Boolean is
      (Self.Connected
@@ -321,15 +369,19 @@ package body AHT.Transport.TLS is
      (St     : Backend_State_Access;
       DL     : Ada.Real_Time.Time;
       Epoch0 : Epoch_Type;
-      Where  : String) is
+      Where  : String)
+   is
+      Held : Boolean := False;  --  SSL_Lock owned by this task
    begin
       Seize (St.Drain_Lock, St, DL, Epoch0, Where, "output drain lock");
       begin
          loop
             Seize (St.SSL_Lock, St, DL, Epoch0, Where, "engine lock");
+            Held := True;
             Stage_From_Engine (St);
             if St.Staged.Is_Empty then
                St.SSL_Lock.Release;
+               Held := False;
                exit;
             end if;
             declare
@@ -339,17 +391,13 @@ package body AHT.Transport.TLS is
             begin
                St.Staged.Clear;
                St.SSL_Lock.Release;
+               Held := False;
                St.TCP.Write (Slice, Deadline => DL);
             end;
          end loop;
       exception
          when E : others =>
-            St.Drain_Lock.Release;
-            Latch_Engine_Dead
-              (St, Where & " drain failed: "
-               & Ada.Exceptions.Exception_Name (E) & " - "
-               & Ada.Exceptions.Exception_Message (E));
-            Drop_Connection (St);
+            Fail_Output (St, Held, Where, "drain", E);
             raise;
       end;
       St.Drain_Lock.Release;
@@ -367,31 +415,37 @@ package body AHT.Transport.TLS is
       Status : out Try_Flush_Status)
    is
       Count : Natural;
+      Held  : Boolean := False;  --  SSL_Lock owned by this task
    begin
       Status := Flushed;
       St.Drain_Lock.Seize;
       begin
          loop
             St.SSL_Lock.Seize;
+            Held := True;
             Stage_From_Engine (St);
             if St.Staged.Is_Empty then
                St.SSL_Lock.Release;
+               Held := False;
                exit;
             end if;
             declare
                Chunk : constant AHT.Bytes.Byte_Array := St.Staged.To_Array;
             begin
                St.SSL_Lock.Release;
+               Held := False;
                St.TCP.Try_Write (Chunk, Count);
                --  Nothing else appends to Staged while Drain_Lock is
                --  held, so Chunk is still exactly its contents.
                St.SSL_Lock.Seize;
+               Held := True;
                if Count = Chunk'Length then
                   St.Staged.Clear;
                else
                   St.Staged.Set (Chunk (Count + 1 .. Chunk'Last));
                end if;
                St.SSL_Lock.Release;
+               Held := False;
                if Count < Chunk'Length then
                   Status := Would_Block;
                   exit;
@@ -400,12 +454,7 @@ package body AHT.Transport.TLS is
          end loop;
       exception
          when E : others =>
-            St.Drain_Lock.Release;
-            Latch_Engine_Dead
-              (St, Where & " push failed: "
-               & Ada.Exceptions.Exception_Name (E) & " - "
-               & Ada.Exceptions.Exception_Message (E));
-            Drop_Connection (St);
+            Fail_Output (St, Held, Where, "push", E);
             raise;
       end;
       St.Drain_Lock.Release;
