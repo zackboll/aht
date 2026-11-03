@@ -96,19 +96,69 @@ package AHT.Transport.TLS is
    --  can feed the TLS input queue without leaving the socket readable.
    --  Blocking Read and Write retain their concurrency contract above.
 
+   type Try_Flush_Status is (Flushed, Would_Block);
+
+   procedure Try_Flush
+     (Self   : in out TLS_Transport;
+      Status : out Try_Flush_Status);
+   --  Push pending ciphertext to the socket without waiting for it:
+   --  whatever the engine has queued (a KeyUpdate reply or alert
+   --  produced by Try_Read, a record left behind by Try_Write) plus
+   --  anything an earlier call could not send. Returns Flushed when
+   --  nothing is pending afterwards, Would_Block when the socket
+   --  refused some of it; the remainder stays queued, in wire order,
+   --  for the next Try_Flush, Try_Write, or a blocking Write or Read
+   --  (which drain it before their own output). Work per call is
+   --  bounded by what is queued; nothing new is generated here. A
+   --  socket failure poisons the session and raises TLS_Error or
+   --  Transport_Error, as a blocking drain does. Same precondition as
+   --  Try_Read: no concurrent Read, Try_Read, Write or Try_Write.
+
+   type Try_Write_Status is (Accepted, Would_Block, Needs_Read);
+
+   procedure Try_Write
+     (Self   : in out TLS_Transport;
+      Data   : AHT.Bytes.Byte_Array;
+      Count  : out Natural;
+      Status : out Try_Write_Status);
+   --  Hand plaintext to the engine without waiting for the network.
+   --  Pending ciphertext is pushed first (as Try_Flush); while any
+   --  remains, Status is Would_Block and Count is 0: no plaintext is
+   --  accepted on top of unsent output, which bounds the queue to
+   --  about one record over what the socket took. Otherwise one
+   --  engine write of at most 16 KiB of Data: Accepted with Count the
+   --  number of leading bytes the engine consumed (they are encrypted
+   --  and never to be passed again), followed by one push of the
+   --  resulting ciphertext; the part the socket refused stays queued.
+   --  Accepted does not mean the ciphertext reached the peer: call
+   --  Try_Flush until Flushed for that. Needs_Read (Count 0) means the
+   --  engine wants a record from the peer before it can encrypt (a
+   --  post-handshake message in flight): drive Try_Read, then retry.
+   --  Empty Data: Accepted, Count 0, after the push. Errors poison the
+   --  session as in Write. Same precondition as Try_Read.
+
+   function Pending_Output (Self : TLS_Transport) return Natural;
+   --  Bytes of ciphertext queued for the socket: produced by the
+   --  engine and not yet sent, including what Try_Flush or Try_Write
+   --  could not push. 0 when nothing is pending, and on a closed or
+   --  never-connected object. Same precondition as Is_Connected.
+
    procedure Abortive_Close (Self : in out TLS_Transport);
    --  Drops the session without a close_notify: frees the backend
    --  contexts and closes the inner TCP transport, never writing to
    --  the socket, so it cannot wait on a peer that has stopped
-   --  reading. The peer sees a truncated stream; use Close where it
-   --  must see an authenticated end. Idempotent, also after a fatal
-   --  error and on a never-connected object. Same precondition as
-   --  Close. Does not change Close or the inherited Finalize.
+   --  reading. Ciphertext still pending from the nonblocking
+   --  operations is discarded with the contexts. The peer sees a
+   --  truncated stream; use Close where it must see an authenticated
+   --  end. Idempotent, also after a fatal error and on a
+   --  never-connected object. Same precondition as Close. Does not
+   --  change Close or the inherited Finalize.
 
    overriding procedure Close (Self : in out TLS_Transport);
    --  Closes: best-effort close_notify (skipped after a fatal error),
-   --  then the inner TCP transport, then frees the backend contexts.
-   --  Idempotent.
+   --  preceded by any ciphertext the nonblocking operations left
+   --  pending, then the inner TCP transport, then frees the backend
+   --  contexts. Idempotent.
    --  Precondition: no other task is inside any operation on this
    --  transport, Is_Connected and the deadline setters included; they
    --  dereference the state Close frees. Not enforced. For the

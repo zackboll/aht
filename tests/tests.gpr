@@ -70,6 +70,7 @@ project Tests is
       "test_tls_retry.adb",
       "test_tls_truncation.adb",
       "test_tls_try_read.adb",
+      "test_tls_try_write.adb",
       "test_tls_corrupt.adb",
       "test_tls_concurrent_corrupt.adb",
       "test_tls_bad_handshake.adb",

@@ -1,0 +1,30 @@
+--  Copyright (C) 2026 Contributors to AHT
+--  SPDX-License-Identifier: Apache-2.0
+
+with "../../aht.gpr";
+
+--  The allocation-failure test for the TLS output staging code. Its
+--  own project because it links a replacement System.Memory
+--  (src/s-memory.adb), which every allocation in the image goes
+--  through, and that must not reach the mains in tests.gpr. The
+--  binary lands next to them so tests/run_tests.sh runs it the same
+--  way.
+project Fault is
+
+   for Source_Dirs use ("src");
+   for Object_Dir  use "../obj/" & Aht.Variant & "/fault";
+   for Exec_Dir    use "../bin/" & Aht.Variant;
+   for Main use ("test_tls_staging_fault.adb");
+
+   package Compiler is
+      for Default_Switches ("Ada") use
+        Aht.Compiler'Default_Switches ("Ada");
+      --  A body for a child of System is only accepted in GNAT's
+      --  run-time mode; that mode's style set is not this project's.
+      for Switches ("s-memory.adb") use
+        Aht.Compiler'Default_Switches ("Ada") & ("-gnatg", "-gnatyN");
+   end Compiler;
+
+   package Binder renames Aht.Binder;
+
+end Fault;

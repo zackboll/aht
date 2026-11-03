@@ -147,10 +147,16 @@ promptly, and all network waiting happens in Ada outside the library:
   `Engine_Dead` before the lock is released, with the reason, so the
   operations rejected afterwards report what killed the session.
 - **Drain (wire output).** Under `Drain_Lock` (strict order: Drain
-  outer, SSL inner), queued ciphertext is extracted and written to
-  the TCP transport; extraction under the drain lock keeps wire
-  order. A drain failure is fail-closed: ciphertext may be half-sent,
-  so the engine dies and the inner TCP is poisoned.
+  outer, SSL inner), queued ciphertext is extracted one chunk at a
+  time into `Staged` and written to the TCP transport; extraction
+  under the drain lock keeps wire order. `Staged` holds ciphertext
+  already taken out of the engine's queue (on openssl `BIO_read` is
+  destructive) that the socket has not accepted, so it is always
+  older than what the engine still holds and every drain ships it
+  first. A blocking drain empties it in one write; the nonblocking
+  push below may leave a remainder there. A drain failure is
+  fail-closed: ciphertext may be half-sent, so the engine dies and
+  the inner TCP is poisoned.
 - **Feed (wire input).** A protected coordinator arbitrates the
   single `TCP.Read` through an atomic feeder claim. The non-owner
   parks on a single-waiter armed latch (claim failure and arming are
@@ -191,11 +197,30 @@ promptly, and all network waiting happens in Ada outside the library:
   replies can precede the next application write, but a TLS 1.2
   renegotiation refusal can leave a peer waiting for its alert.
   `Try_Read` alone does not guarantee output progress; callers needing
-  prompt control replies must use the blocking operations and their
-  deadlines. On mbedtls `Engine_Call` remembers close_notify from
+  prompt control replies use `Try_Flush`, or the blocking operations
+  and their deadlines. On mbedtls `Engine_Call` remembers close_notify from
   either read operation in `Close_Notified`: `mbedtls_ssl_read` reports
   it once, then reads on to TCP EOF. Blocking `Read` still returns
   `Last = 0` for either end condition.
+- **Try_Flush and Try_Write** are the drain and the write loop with
+  the waits removed. The push (`Push_Output`) stages a chunk, hands it
+  to `TCP.Try_Write` (one non-blocking send, no selector park), keeps
+  whatever the socket refused in `Staged`, and reports `Would_Block`
+  for that or `Flushed` for an empty queue. `Try_Write` pushes first
+  and refuses new plaintext (`Would_Block`, `Count = 0`) while any
+  ciphertext is pending, so the queue never holds more than one
+  record beyond what the socket took; otherwise one engine write of
+  at most 16 KiB, `Accepted` with the count the engine consumed, then
+  one push. `Accepted` is about the engine, not the peer: `Try_Flush`
+  until `Flushed` is the only way to know the ciphertext left. A
+  `WANT_READ` from the write is `Needs_Read`: the caller drives
+  `Try_Read` and retries. `Engine_Call` counts `Staged` in its pending
+  sample, so a blocking `Write` or `Read` that follows ships the
+  leftover before anything of its own, and `Close` ships it before
+  the close_notify. `Pending_Output` reports the queue size. The same
+  exclusive-I/O precondition as `Try_Read` applies; a push failure is
+  fail-closed like a drain failure, and `Abortive_Close` discards the
+  queue with the contexts.
 
 The locks and coordinator live in `AHT.TLS_Sync`, shared by both
 bodies and kept separate so that a test can drive the claim, arm,
