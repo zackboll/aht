@@ -321,6 +321,50 @@ package body AHT.Transport.TLS is
       Drop_Connection (St);
    end Fail_Output;
 
+   --  Fail-closed cleanup for the receive side, the mirror of
+   --  Fail_Output: the ciphertext a failed feed was carrying exists
+   --  nowhere else, so the record stream cannot be resumed. Held says
+   --  whether the exception left SSL_Lock held (the handoff into the
+   --  inbound queue allocates under it): then the engine is marked
+   --  dead in place and the lock released, never re-seized through
+   --  Latch_Engine_Dead, which would wait on the lock this task owns.
+   --  The flag is set before the reason is built, and the reason is
+   --  best effort, as in Fail_Output. The feeder claim is dropped
+   --  last, so a task woken by the release observes the dead session
+   --  instead of claiming the feeder for a socket that is gone.
+   procedure Fail_Input
+     (St    : Backend_State_Access;
+      Held  : Boolean;
+      Where : String;
+      E     : Ada.Exceptions.Exception_Occurrence)
+   is
+      procedure Mark is
+      begin
+         if not St.Engine_Dead then
+            St.Engine_Dead := True;
+            begin
+               St.Death_Reason.Set
+                 (Where & " input failed: "
+                  & Ada.Exceptions.Exception_Name (E) & " - "
+                  & Ada.Exceptions.Exception_Message (E));
+            exception
+               when others => null;
+            end;
+         end if;
+      end Mark;
+   begin
+      if Held then
+         Mark;
+         St.SSL_Lock.Release;
+      else
+         St.SSL_Lock.Seize;
+         Mark;
+         St.SSL_Lock.Release;
+      end if;
+      Drop_Connection (St);
+      St.Coord.Release_Feeder;
+   end Fail_Input;
+
    function Live (Self : TLS_Transport) return Boolean is
      (Self.Connected
       and then Self.State /= null
@@ -489,26 +533,49 @@ package body AHT.Transport.TLS is
          return;
       end if;
 
+      declare
+         Buf  : AHT.Bytes.Byte_Array (1 .. Chunk_Max);
+         Last : Natural;
+         Held : Boolean := False;  --  SSL_Lock owned by this task
       begin
-         declare
-            Buf  : AHT.Bytes.Byte_Array (1 .. Chunk_Max);
-            Last : Natural;
+         --  The socket wait. Its deadline and abort outcomes end the
+         --  operation, not the session: nothing has left the socket.
+         --  Anything else (a reset, a poisoned or closed TCP) is the
+         --  end of the stream, and the session dies with it.
          begin
             St.TCP.Read (Buf, Last, Deadline => DL);
+         exception
+            when AHT.Transport.Timeout_Error
+               | AHT.Transport.Aborted_Error =>
+               St.Coord.Release_Feeder;
+               raise;
+            when E : others =>
+               Fail_Input (St, False, Where, E);
+               raise;
+         end;
+
+         --  The handoff. Bytes taken off the wire exist nowhere else
+         --  until the inbound queue holds them, so a failure here, the
+         --  deadline and an allocation failure included, leaves a gap
+         --  no later call can fill.
+         begin
             Seize (St.SSL_Lock, St, DL, Epoch0, Where, "engine lock");
+            Held := True;
             if Last = 0 then
                St.IO.In_EOF := True;
                St.SSL_Lock.Release;
+               Held := False;
                St.Coord.Latch_EOF;
             else
                St.IO.In_Data.Append (Buf (1 .. Last));
                St.SSL_Lock.Release;
+               Held := False;
             end if;
+         exception
+            when E : others =>
+               Fail_Input (St, Held, Where, E);
+               raise;
          end;
-      exception
-         when others =>
-            St.Coord.Release_Feeder;
-            raise;
       end;
       St.Coord.Release_Feeder;
       Check_Abort (St, Epoch0, Where);
@@ -529,32 +596,39 @@ package body AHT.Transport.TLS is
          return;
       end if;
 
+      --  No wait here, so there is no deadline or abort outcome to
+      --  keep nonfatal: Would_Block is a status, and every exception
+      --  (a reset from the socket, a failed handoff into the inbound
+      --  queue) ends the stream, as in Feed.
+      declare
+         Buf    : AHT.Bytes.Byte_Array (1 .. Chunk_Max);
+         Last   : Natural;
+         Status : AHT.Transport.TCP.Try_Read_Status;
+         Held   : Boolean := False;  --  SSL_Lock owned by this task
       begin
-         declare
-            Buf    : AHT.Bytes.Byte_Array (1 .. Chunk_Max);
-            Last   : Natural;
-            Status : AHT.Transport.TCP.Try_Read_Status;
-         begin
-            St.TCP.Try_Read (Buf, Last, Status);
-            case Status is
-               when AHT.Transport.TCP.Would_Block =>
-                  null;
-               when AHT.Transport.TCP.Peer_Closed =>
-                  St.SSL_Lock.Seize;
-                  St.IO.In_EOF := True;
-                  St.SSL_Lock.Release;
-                  St.Coord.Latch_EOF;
-                  Fed := True;
-               when AHT.Transport.TCP.Data_Ready =>
-                  St.SSL_Lock.Seize;
-                  St.IO.In_Data.Append (Buf (1 .. Last));
-                  St.SSL_Lock.Release;
-                  Fed := True;
-            end case;
-         end;
+         St.TCP.Try_Read (Buf, Last, Status);
+         case Status is
+            when AHT.Transport.TCP.Would_Block =>
+               null;
+            when AHT.Transport.TCP.Peer_Closed =>
+               St.SSL_Lock.Seize;
+               Held := True;
+               St.IO.In_EOF := True;
+               St.SSL_Lock.Release;
+               Held := False;
+               St.Coord.Latch_EOF;
+               Fed := True;
+            when AHT.Transport.TCP.Data_Ready =>
+               St.SSL_Lock.Seize;
+               Held := True;
+               St.IO.In_Data.Append (Buf (1 .. Last));
+               St.SSL_Lock.Release;
+               Held := False;
+               Fed := True;
+         end case;
       exception
-         when others =>
-            St.Coord.Release_Feeder;
+         when E : others =>
+            Fail_Input (St, Held, "TLS try-read", E);
             raise;
       end;
       St.Coord.Release_Feeder;
