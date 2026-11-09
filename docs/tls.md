@@ -165,7 +165,17 @@ promptly, and all network waiting happens in Ada outside the library:
   retries. This is sound because the transport contract allows at
   most one reader and one writer task. A write that needs a record
   from the peer (`WANT_READ` mid-write) feeds itself when the claim
-  is free and otherwise waits, bounded by the write deadline.
+  is free and otherwise waits, bounded by the write deadline. A feed
+  is fail-closed past its socket wait: a `TCP.Read` or `TCP.Try_Read`
+  that fails with anything but a deadline or an abort (a reset, a
+  poisoned socket), or a handoff into the engine's input that fails
+  once bytes are off the wire, marks the engine dead, latches Fatal,
+  poisons the inner TCP and only then releases the feeder claim, so
+  the woken task finds a dead session. The exception propagates
+  unchanged (`Transport_Error` for the socket). A deadline or abort
+  during the wait itself ends the operation only; nothing was taken
+  from the socket. EOF is not a failure here: it is latched for the
+  engine to classify.
 - **Deadlines.** Both `Set_*_Deadline` budgets are mirrored as
   absolute instants computed once at the setter call. Every blocking
   step (lock seize as a timed entry call, latch wait, feed
