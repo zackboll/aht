@@ -17,6 +17,8 @@ with AHT.Transport;
 with AHT.Transport.TCP;
 with AHT.URL;
 
+with Socket_Fault;
+
 procedure Test_TCP is
 
    Failures : Natural := 0;
@@ -2293,15 +2295,17 @@ begin
    --  Case 19: Peer_Reset is the receive-side reset and nothing else.
    --  A real RST (SO_LINGER 0) seen by Read and by Try_Read sets it and
    --  raises Transport_Error; a FIN does not; a reset that only a send
-   --  ran into does not; Close leaves it.
+   --  ran into does not; a receive that fails with another error
+   --  (Socket_Fault, POSIX only) does not; Close leaves it.
    declare
       use type AHT.Transport.TCP.Try_Read_Status;
-      type Ending is (Reset_Read, Reset_Try_Read, Fin, Reset_Send);
+      type Ending is (Reset_Read, Reset_Try_Read, Fin, Reset_Send, Broken);
       Buf    : AHT.Bytes.Byte_Array (1 .. 64);
       Last   : Natural;
       Status : AHT.Transport.TCP.Try_Read_Status;
    begin
       for How in Ending loop
+         exit when How = Broken and then not Socket_Fault.Supported;
          declare
             Listener : Socket_Type := No_Socket;
             Peer     : Socket_Type := No_Socket;
@@ -2326,6 +2330,12 @@ begin
 
             if How = Fin then
                Close_Peer_Quietly (Peer);
+            elsif How = Broken then
+               if not Socket_Fault.Break_Socket_To
+                        (Natural (Get_Socket_Name (Listener).Port))
+               then
+                  Fail (W & ": could not replace the socket");
+               end if;
             else
                Set_Socket_Option
                  (Peer, Socket_Level,
@@ -2338,9 +2348,9 @@ begin
             T.Set_Write_Deadline (5.0);
             begin
                case How is
-                  when Reset_Read | Fin =>
+                  when Reset_Read | Fin | Broken =>
                      T.Read (Buf, Last);
-                     if How = Reset_Read or else Last /= 0 then
+                     if How /= Fin or else Last /= 0 then
                         Fail (W & ": Read returned Last =" & Last'Image);
                      end if;
                   when Reset_Try_Read =>
@@ -2377,6 +2387,7 @@ begin
                   Fail (W & ": Close changed Peer_Reset");
                end if;
             end;
+            Close_Peer_Quietly (Peer);
             Close_Peer_Quietly (Listener);
          exception
             when E : others =>

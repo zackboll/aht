@@ -16,6 +16,8 @@ command byte from the client decides how the session ends:
           a second, in a single send, then await the next command;
           a client that has read the banner has the half record too
     b"C"  clean: close_notify, then FIN
+    b"N"  close_notify, then the RST as for b"R" once the client's
+          kernel has acknowledged the close_notify
     b"F"  FIN without close_notify
 
 The TLS state lives in memory BIOs, so the record for b"H" is the
@@ -40,6 +42,7 @@ import ssl
 import struct
 import sys
 import threading
+import time
 
 HOST = "127.0.0.1"
 PORT = 8781
@@ -61,6 +64,25 @@ def reset_close(conn: socket.socket) -> None:
         socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
     )
     conn.close()
+
+
+def wait_acked(conn: socket.socket) -> None:
+    # Until the peer's kernel has acknowledged everything sent, so a
+    # reset that follows cannot discard it unsent. TIOCOUTQ counts the
+    # bytes not yet acknowledged on Linux; where it is unavailable a
+    # short pause stands in.
+    try:
+        import fcntl
+        import termios
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            raw = fcntl.ioctl(conn.fileno(), termios.TIOCOUTQ, b"\0" * 4)
+            if struct.unpack("i", raw)[0] == 0:
+                return
+            time.sleep(0.001)
+    except (ImportError, AttributeError, OSError):
+        time.sleep(0.1)
 
 
 def serve_one(conn: socket.socket, ctx: ssl.SSLContext) -> None:
@@ -117,6 +139,15 @@ def serve_one(conn: socket.socket, ctx: ssl.SSLContext) -> None:
             flush()
             conn.shutdown(socket.SHUT_RDWR)
             conn.close()
+            return
+        elif cmd == b"N":
+            try:
+                tls.unwrap()
+            except ssl.SSLWantReadError:
+                pass
+            flush()
+            wait_acked(conn)
+            reset_close(conn)
             return
         elif cmd == b"F":
             conn.shutdown(socket.SHUT_RDWR)

@@ -18,7 +18,10 @@
 --       record then the reset, and a whole record with half of the
 --       next in one send, the whole one read first, then the reset
 --    C. close_notify: Last = 0 / Peer_Closed, No_Failure, also after
---       Close
+--       Close. A reset that follows a close_notify is never
+--       Network_Reset: Try_Read keeps reporting Peer_Closed, and a
+--       further Read either repeats Last = 0 (openssl, No_Failure) or
+--       runs into the reset (mbedtls, Other_Failure)
 --    D. FIN without close_notify: never Network_Reset. Try_Read
 --       raises TLS_Error and reports Other_Failure on both backends;
 --       Read keeps its backend policy (TLS_Error and Other_Failure on
@@ -34,6 +37,10 @@
 --       deadline that fires mid-record poisons, and is Other_Failure.
 --       A reset discovered by a send, with nothing read, is
 --       Other_Failure: only a failed receive carries the proof.
+--       A receive that fails with an error other than a reset, on a
+--       healthy session at a record boundary, is Other_Failure
+--       (Socket_Fault swaps the socket for /dev/null; POSIX only,
+--       skipped and reported elsewhere).
 --    H. after every fatal case Read, Try_Read, Write, Try_Write and
 --       Try_Flush are refused and the cause is what it was
 --    I. fifty reset, Abortive_Close, Abortive_Close, Close cycles:
@@ -46,6 +53,10 @@
 --      was received with the whole one rests on the fixture sending
 --      both in one send, and on the case failing when the
 --      record-boundary condition is removed from Fail_Input
+--    - unprocessed whole records in the engine's input queue when a
+--      reset arrives: it takes the writer feeding between the
+--      reader's engine call and its socket read, which traffic cannot
+--      force. That condition in Fail_Input rests on its own argument.
 --    - a reset during the handshake: Connect fails, there is no
 --      session, and Last_Failure stays No_Failure by construction
 --    - a blocking Write after Abort_Pending interrupted a Read: it
@@ -65,6 +76,8 @@ with AHT.Bytes;
 with AHT.Transport;
 with AHT.Transport.TLS;
 with AHT.URL;
+
+with Socket_Fault;
 
 procedure Test_TLS_Failure_Cause is
 
@@ -429,6 +442,42 @@ begin
       end;
    end loop;
 
+   --  Case C: close_notify, then a reset. The close was authenticated
+   --  and seen first; whatever a later read meets, it is not a proven
+   --  interruption of a healthy session.
+   declare
+      T : TLS_Transport;
+      W : constant String := "C/then-reset";
+   begin
+      Connect (T);
+      Command (T, 'N');
+      T.Read (Buf, Last);
+      if Last /= 0 then
+         Fail (W & ": close_notify not delivered first, Last ="
+               & Last'Image);
+      end if;
+      Expect_Cause (T, No_Failure, W & " after close_notify");
+      T.Try_Read (Buf, Last, Status);
+      if Status /= Peer_Closed then
+         Fail (W & ": Try_Read after close_notify gave " & Status'Image);
+      end if;
+      Expect_Cause (T, No_Failure, W & " after Try_Read");
+      begin
+         T.Read (Buf, Last);
+         if Last /= 0 then
+            Fail (W & ": a second Read returned data");
+         end if;
+         Expect_Cause (T, No_Failure, W & " after a second clean Read");
+      exception
+         when AHT.Transport.Transport_Error | TLS_Error =>
+            Expect_Cause (T, Other_Failure, W & " after the reset");
+      end;
+      Release (T, T.Last_Failure, W);
+   exception
+      when E : others =>
+         Fail (W & ": " & Image (E));
+   end;
+
    --  Case D: FIN without close_notify. Try_Read fails closed on both
    --  backends; Read keeps the backend's policy. Neither is a reset.
    declare
@@ -678,6 +727,34 @@ begin
       when E : others =>
          Fail ("G/send-reset: " & Image (E));
    end;
+
+   --  Case G: a receive that fails, but not with a reset. Everything
+   --  else Network_Reset requires holds here: the session is healthy,
+   --  at a record boundary, with nothing unprocessed.
+   if Socket_Fault.Supported then
+      for How in Reader loop
+         declare
+            T : TLS_Transport;
+            W : constant String := "G/other-receive-error/" & How'Image;
+         begin
+            Connect (T);
+            Echo (T, W);
+            if not Socket_Fault.Break_Socket_To (Natural (Reset_Port)) then
+               Fail (W & ": could not replace the session's socket");
+            else
+               Expect_Outcome (End_Of (T, How, W), Transport, W);
+               Expect_Dead (T, Other_Failure, W);
+            end if;
+            Release (T, T.Last_Failure, W);
+         exception
+            when E : others =>
+               Fail (W & ": " & Image (E));
+         end;
+      end loop;
+   else
+      Put_Line ("test_tls_failure_cause: SKIP non-reset receive error "
+                & "(sockets are not file descriptors here)");
+   end if;
 
    --  Case I: repeated reset and release, fd-accounted.
    declare
