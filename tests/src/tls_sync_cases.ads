@@ -7,7 +7,8 @@
 --  the claim/arm atomicity, wake-on-release, abort-wakes-parked-waiter
 --  and deadline-expiry-while-parked behaviors are the same code on
 --  either backend, and end-to-end traffic cannot force them
---  deterministically.
+--  deterministically. Also here: the reset latch's first-failure rule
+--  and AHT.TLS_Sync.Record_Tracker, which Last_Failure rests on.
 package TLS_Sync_Cases is
 
    function Run (Label : String) return Natural;

@@ -9,6 +9,8 @@
 --  single socket read while the other parks. Separate from the bodies
 --  so the claim/arm/wake/abort behaviour can be unit-tested directly
 --  (test_tls_keyupdate drives it). See docs/tls.md for the design.
+with AHT.Bytes;
+
 package AHT.TLS_Sync is
 
    --  Plain mutex as a protected object so callers can do timed entry
@@ -54,6 +56,16 @@ package AHT.TLS_Sync is
       function EOF return Boolean;
       function Fatal return Boolean;
 
+      procedure Latch_Reset;
+      --  Latch_Fatal for a session ended by the peer's TCP reset. The
+      --  reset is recorded only when this call is the one that makes
+      --  the session fatal: a failure latched earlier keeps its
+      --  identity, and no later latch changes the answer.
+
+      function Reset return Boolean;
+      --  True when the latch that made the session fatal was
+      --  Latch_Reset. Implies Fatal.
+
       procedure Bump_Abort;
       --  Fires the latch and advances the epoch. Operations snapshot
       --  the epoch at entry and re-check it after every blocking step
@@ -69,7 +81,39 @@ package AHT.TLS_Sync is
       Fired          : Boolean := False;
       Is_EOF         : Boolean := False;
       Is_Fatal       : Boolean := False;
+      Is_Reset       : Boolean := False;
       Epoch          : Epoch_Type := 0;
    end Coordinator_Type;
+
+   --  Position of the inbound ciphertext stream within TLS record
+   --  framing (a 5-byte header whose last two bytes are the big-endian
+   --  body length, in every protocol version both backends speak).
+   --  Counts bytes only; whether a record is valid is the engine's
+   --  business. Not protected: fed by whichever task performs the
+   --  socket read, which the handshake's single task and afterwards
+   --  the feeder claim make exclusive.
+   type Record_Tracker is private;
+
+   procedure Note
+     (Tracker : in out Record_Tracker;
+      Data    : AHT.Bytes.Byte_Array);
+   --  Account for Data, the next bytes received from the socket.
+
+   function At_Boundary (Tracker : Record_Tracker) return Boolean;
+   --  True when every byte noted so far belongs to a complete record:
+   --  no header and no body is partly received. True initially.
+
+private
+
+   type Header_Count is range 0 .. 4;
+
+   type Record_Tracker is record
+      Header_Got : Header_Count := 0;
+      --  Header bytes of the record in progress already seen.
+      Length_Hi  : AHT.Bytes.Octet := 0;
+      --  Its fourth header byte, kept until the fifth arrives.
+      Body_Left  : Natural := 0;
+      --  Body bytes of the record in progress still to come.
+   end record;
 
 end AHT.TLS_Sync;

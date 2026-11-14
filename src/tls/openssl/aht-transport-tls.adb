@@ -79,6 +79,11 @@ package body AHT.Transport.TLS is
       Drain_Lock : Lock_Type;
       Coord      : AHT.TLS_Sync.Coordinator_Type;
 
+      Inbound : AHT.TLS_Sync.Record_Tracker;
+      --  Record framing of every byte received from the socket, the
+      --  handshake's included. Touched only by the task performing
+      --  the socket read: Connect's, then the feeder-claim holder.
+
       Engine_Dead : Boolean := False;
       Death_Reason : AHT.Bytes.Buffer;
       --  Guarded by SSL_Lock. Set, before the lock is released, on
@@ -242,15 +247,31 @@ package body AHT.Transport.TLS is
    --  Fail_Output. The feeder claim is dropped last, so a task woken
    --  by the release observes the dead session instead of claiming the
    --  feeder for a socket that is gone.
+   --
+   --  This is also the one place a failure is classified as the
+   --  peer's reset (Last_Failure = Network_Reset), and only when all
+   --  of these hold, each a typed fact: the inner TCP recorded the
+   --  connection-reset error code on a receive; the engine was alive
+   --  until now; every byte received so far formed complete records;
+   --  and RBIO is empty, so the engine has been through all of them.
+   --  The feeder runs only after an engine call wanted input, so with
+   --  those two the engine holds no record it has not judged.
+   --  Latch_Reset then records it only if no other failure latched
+   --  Fatal first.
    procedure Fail_Input
      (St    : Backend_State_Access;
       Held  : Boolean;
       Where : String;
       E     : Ada.Exceptions.Exception_Occurrence)
    is
+      Clean : Boolean := False;
+      --  The engine was alive with no unprocessed input. Under
+      --  SSL_Lock.
+
       procedure Mark is
       begin
          if not St.Engine_Dead then
+            Clean := OBIO.Ctrl_Pending (St.RBio) = 0;
             St.Engine_Dead := True;
             begin
                St.Death_Reason.Set
@@ -271,9 +292,24 @@ package body AHT.Transport.TLS is
          Mark;
          St.SSL_Lock.Release;
       end if;
+      if Clean
+        and then St.TCP.Peer_Reset
+        and then AHT.TLS_Sync.At_Boundary (St.Inbound)
+      then
+         St.Coord.Latch_Reset;
+      end if;
       Drop_Connection (St);
       St.Coord.Release_Feeder;
    end Fail_Input;
+
+   function Current_Cause (St : Backend_State_Access) return Failure_Cause
+   is (if not St.Coord.Fatal then No_Failure
+       elsif St.Coord.Reset then Network_Reset
+       else Other_Failure);
+
+   function Last_Failure (Self : TLS_Transport) return Failure_Cause is
+     (if Self.State = null then Self.Cause
+      else Current_Cause (Self.State));
 
    function Live (Self : TLS_Transport) return Boolean is
      (Self.Connected
@@ -477,6 +513,7 @@ package body AHT.Transport.TLS is
                Fail_Input (St, False, Where, E);
                raise;
          end;
+         AHT.TLS_Sync.Note (St.Inbound, Buf (1 .. Last));
 
          --  The handoff. Bytes taken off the wire exist nowhere else
          --  until RBIO holds them, so a failure here, the deadline
@@ -559,6 +596,7 @@ package body AHT.Transport.TLS is
                St.Coord.Latch_EOF;
                Fed := True;
             when AHT.Transport.TCP.Data_Ready =>
+               AHT.TLS_Sync.Note (St.Inbound, Buf (1 .. Last));
                St.SSL_Lock.Seize;
                Held := True;
                Wrote := OBIO.Write (St.RBio, Buf'Address, C.int (Last));
@@ -985,6 +1023,7 @@ package body AHT.Transport.TLS is
                   Fail ("TLS handshake",
                         "peer closed during handshake");
                end if;
+               AHT.TLS_Sync.Note (Self.State.Inbound, Buf (1 .. Last));
                if OBIO.Write (Self.State.RBio, Buf'Address, C.int (Last))
                  /= C.int (Last)
                then
@@ -1372,6 +1411,7 @@ package body AHT.Transport.TLS is
          Self.Connected := False;
          return;
       end if;
+      Self.Cause := Current_Cause (St);
       Self.State := null;
 
       --  Block 1 (best-effort): SSL_shutdown + final drain, skipped for
@@ -1442,6 +1482,9 @@ package body AHT.Transport.TLS is
       --  TCP.Write that could park on a full send buffer. Release_State
       --  does the rest (TCP.Close, SSL_free, SSL_CTX_free) and nulls
       --  State, which makes a second call a no-op.
+      if Self.State /= null then
+         Self.Cause := Current_Cause (Self.State);
+      end if;
       Self.Connected := False;
       Release_State (Self);
    end Abortive_Close;

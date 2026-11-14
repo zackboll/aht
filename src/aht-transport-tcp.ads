@@ -148,6 +148,14 @@ package AHT.Transport.TCP is
    --  fired. A poisoned transport is single-use: Close it and use a
    --  fresh object.
 
+   function Peer_Reset (Self : TCP_Transport) return Boolean;
+   --  True once a receive on this connection failed because the peer
+   --  reset it (ECONNRESET, WSAECONNRESET), taken from the socket
+   --  error code of that receive and from nothing else. Latched until
+   --  the object is finalized; Close and Poison leave it. False for
+   --  every other failure, a failed send included, and for an EOF.
+   --  Task-safe.
+
 private
 
    type TCP_Transport is new Transport_Type with record
@@ -168,6 +176,8 @@ private
       --  parked in Check_Selector decides what its wake means by
       --  reading it. The other flags are written only by Connect
       --  and Close, which the lifecycle contract single-threads.
+      Reset_Seen         : Boolean := False with Atomic;
+      --  Atomic: set by the reader, read by Peer_Reset from any task.
       Used               : Boolean := False;
       --  Latched True at the first successful Connect, never
       --  cleared, not even by Close. A failed Connect leaves it

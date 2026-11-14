@@ -251,6 +251,13 @@ Any `Socket_Error` or `Host_Error` during `Connect`, `Write` or
 `Read` is re-raised as `Transport_Error` with the OS message
 appended, so callers never see `GNAT.Sockets` exceptions.
 
+`Peer_Reset` is true once a receive failed with the connection-reset
+error code. `Read` and `Try_Read` take that code from the socket
+layer directly after the failed `recv`, through the thin binding
+`GNAT.Sockets` itself uses, because `Socket_Error` carries it only
+inside its message text. A failed send does not set it. The TLS
+backends read it to decide `Last_Failure`.
+
 ## `AHT.Transport.TLS`
 
 One backend-neutral spec (`src/aht-transport-tls.ads`) with two
@@ -311,7 +318,10 @@ blocking operations is under *The engine* in [`tls.md`](tls.md).
 
 `Is_Connected` is true after a successful `Connect` until `Close`,
 except that a session poisoned by a fatal `Read`/`Write` reports
-false through a task-safe latch. `Set_Read_Deadline` and
+false through a task-safe latch. `Last_Failure` says whether what
+poisoned it was the peer's TCP reset and nothing else
+(`Network_Reset`), or anything else (`Other_Failure`); see *Failure
+cause* under *The engine* in [`tls.md`](tls.md). `Set_Read_Deadline` and
 `Set_Write_Deadline` are mirrored as absolute times computed once and
 forwarded to the inner TCP; they may be called before `Connect`, in
 which case they apply to the future connection's `Read`/`Write`, not
