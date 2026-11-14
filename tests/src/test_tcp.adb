@@ -17,6 +17,8 @@ with AHT.Transport;
 with AHT.Transport.TCP;
 with AHT.URL;
 
+with Socket_Fault;
+
 procedure Test_TCP is
 
    Failures : Natural := 0;
@@ -2288,6 +2290,114 @@ begin
          Close_Quietly (T);
          Close_Peer_Quietly (Peer);
          Close_Peer_Quietly (Listener);
+   end;
+
+   --  Case 19: Peer_Reset is the receive-side reset and nothing else.
+   --  A real RST (SO_LINGER 0) seen by Read and by Try_Read sets it and
+   --  raises Transport_Error; a FIN does not; a reset that only a send
+   --  ran into does not; a receive that fails with another error
+   --  (Socket_Fault, POSIX only) does not; Close leaves it.
+   declare
+      use type AHT.Transport.TCP.Try_Read_Status;
+      type Ending is (Reset_Read, Reset_Try_Read, Fin, Reset_Send, Broken);
+      Buf    : AHT.Bytes.Byte_Array (1 .. 64);
+      Last   : Natural;
+      Status : AHT.Transport.TCP.Try_Read_Status;
+   begin
+      for How in Ending loop
+         exit when How = Broken and then not Socket_Fault.Supported;
+         declare
+            Listener : Socket_Type := No_Socket;
+            Peer     : Socket_Type := No_Socket;
+            From     : Sock_Addr_Type;
+            Bind_To  : Sock_Addr_Type;
+            T        : AHT.Transport.TCP.TCP_Transport;
+            W        : constant String := "peer-reset/" & How'Image;
+            Raised   : Boolean := False;
+         begin
+            Create_Socket (Listener, Family_Inet, Socket_Stream);
+            Bind_To.Addr := Inet_Addr ("127.0.0.1");
+            Bind_To.Port := 0;
+            Bind_Socket (Listener, Bind_To);
+            Listen_Socket (Listener, 1);
+            T.Connect
+              ("127.0.0.1",
+               AHT.URL.Port_Number (Get_Socket_Name (Listener).Port));
+            Accept_Socket (Listener, Peer, From);
+            if T.Peer_Reset then
+               Fail (W & ": Peer_Reset on a fresh connection");
+            end if;
+
+            if How = Fin then
+               Close_Peer_Quietly (Peer);
+            elsif How = Broken then
+               if not Socket_Fault.Break_Socket_To
+                        (Natural (Get_Socket_Name (Listener).Port))
+               then
+                  Fail (W & ": could not replace the socket");
+               end if;
+            else
+               Set_Socket_Option
+                 (Peer, Socket_Level,
+                  (Name => Linger, Enabled => True, Seconds => 0));
+               Close_Socket (Peer);
+               Peer := No_Socket;
+            end if;
+
+            T.Set_Read_Deadline (5.0);
+            T.Set_Write_Deadline (5.0);
+            begin
+               case How is
+                  when Reset_Read | Fin | Broken =>
+                     T.Read (Buf, Last);
+                     if How /= Fin or else Last /= 0 then
+                        Fail (W & ": Read returned Last =" & Last'Image);
+                     end if;
+                  when Reset_Try_Read =>
+                     for I in 1 .. 1000 loop
+                        T.Try_Read (Buf, Last, Status);
+                        exit when
+                          Status /= AHT.Transport.TCP.Would_Block;
+                        delay 0.005;
+                     end loop;
+                     Fail (W & ": Try_Read gave " & Status'Image);
+                  when Reset_Send =>
+                     for I in 1 .. 1000 loop
+                        T.Write (Buf);
+                        delay 0.005;
+                     end loop;
+                     Fail (W & ": no Write failed");
+               end case;
+            exception
+               when AHT.Transport.Transport_Error =>
+                  Raised := True;
+            end;
+
+            if Raised /= (How /= Fin) then
+               Fail (W & ": Transport_Error raised = " & Raised'Image);
+            end if;
+            if T.Peer_Reset /= (How in Reset_Read | Reset_Try_Read) then
+               Fail (W & ": Peer_Reset is " & T.Peer_Reset'Image);
+            end if;
+            declare
+               Before : constant Boolean := T.Peer_Reset;
+            begin
+               Close_Quietly (T);
+               if T.Peer_Reset /= Before then
+                  Fail (W & ": Close changed Peer_Reset");
+               end if;
+            end;
+            Close_Peer_Quietly (Peer);
+            Close_Peer_Quietly (Listener);
+         exception
+            when E : others =>
+               Fail (W & ": " & Ada.Exceptions.Exception_Name (E) & " — "
+                     & Ada.Exceptions.Exception_Message (E));
+               Close_Quietly (T);
+               Close_Peer_Quietly (Peer);
+               Close_Peer_Quietly (Listener);
+         end;
+      end loop;
    end;
 
    if Failures = 0 then

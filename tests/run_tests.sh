@@ -19,7 +19,8 @@
 # 8767 stall, 8768 wss echo, 8769 deaf TLS, 8771 abrupt close, 8773
 # corrupted record, 8774/8775 invalid or dribbled handshake, 8776
 # concurrent corruption, 8777 hostile WebSocket peer, 8778 fragmented
-# record, 8779 backpressure sink, 8781 commanded reset, 8770
+# record, 8779 backpressure sink, 8781 commanded reset (8782 the same
+# under a certificate issued to another name), 8770
 # go-httpbin (optional; test_httpbin SKIPs without it).
 # test_tls_keyupdate starts its own s_server on 8772,
 # test_tls_try_write on 8780.

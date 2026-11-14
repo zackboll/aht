@@ -12,7 +12,12 @@ command byte from the client decides how the session ends:
           instead of FIN; no close_notify, no FIN
     b"H"  half record then reset: the first half of a record carrying
           BANNER, then the RST as for b"R"
+    b"P"  partial: one record carrying BANNER and the first half of
+          a second, in a single send, then await the next command;
+          a client that has read the banner has the half record too
     b"C"  clean: close_notify, then FIN
+    b"N"  close_notify, then the RST as for b"R" once the client's
+          kernel has acknowledged the close_notify
     b"F"  FIN without close_notify
 
 The TLS state lives in memory BIOs, so the record for b"H" is the
@@ -21,7 +26,12 @@ this file. Reading the command with the SSL layer means the client's
 record reaches the server in the same session, so a b"R" follows a
 record the client has already had decrypted.
 
-Prints `READY tlsreset 127.0.0.1:8781` once listening.
+A second listener on 127.0.0.1:8782 serves the same commands with
+the certificate scripts/generate_cert.sh issues to another name, so
+a client that trusts that certificate still fails verification on
+the host name alone.
+
+Prints `READY tlsreset 127.0.0.1:8781` once both are listening.
 """
 
 from __future__ import annotations
@@ -31,14 +41,19 @@ import socket
 import ssl
 import struct
 import sys
+import threading
+import time
 
 HOST = "127.0.0.1"
 PORT = 8781
+WRONG_NAME_PORT = 8782
 BANNER = b"RESET-FIXTURE-BANNER"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CERT = os.path.join(HERE, "certs", "server.crt")
 KEY = os.path.join(HERE, "certs", "server.key")
+WRONG_CERT = os.path.join(HERE, "certs", "wrongname.crt")
+WRONG_KEY = os.path.join(HERE, "certs", "wrongname.key")
 
 
 def reset_close(conn: socket.socket) -> None:
@@ -49,6 +64,25 @@ def reset_close(conn: socket.socket) -> None:
         socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
     )
     conn.close()
+
+
+def wait_acked(conn: socket.socket) -> None:
+    # Until the peer's kernel has acknowledged everything sent, so a
+    # reset that follows cannot discard it unsent. TIOCOUTQ counts the
+    # bytes not yet acknowledged on Linux; where it is unavailable a
+    # short pause stands in.
+    try:
+        import fcntl
+        import termios
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            raw = fcntl.ioctl(conn.fileno(), termios.TIOCOUTQ, b"\0" * 4)
+            if struct.unpack("i", raw)[0] == 0:
+                return
+            time.sleep(0.001)
+    except (ImportError, AttributeError, OSError):
+        time.sleep(0.1)
 
 
 def serve_one(conn: socket.socket, ctx: ssl.SSLContext) -> None:
@@ -91,6 +125,12 @@ def serve_one(conn: socket.socket, ctx: ssl.SSLContext) -> None:
             conn.sendall(record[: len(record) // 2])
             reset_close(conn)
             return
+        elif cmd == b"P":
+            tls.write(BANNER)
+            whole = outgoing.read()
+            tls.write(BANNER)
+            second = outgoing.read()
+            conn.sendall(whole + second[: len(second) // 2])
         elif cmd == b"C":
             try:
                 tls.unwrap()
@@ -99,6 +139,15 @@ def serve_one(conn: socket.socket, ctx: ssl.SSLContext) -> None:
             flush()
             conn.shutdown(socket.SHUT_RDWR)
             conn.close()
+            return
+        elif cmd == b"N":
+            try:
+                tls.unwrap()
+            except ssl.SSLWantReadError:
+                pass
+            flush()
+            wait_acked(conn)
+            reset_close(conn)
             return
         elif cmd == b"F":
             conn.shutdown(socket.SHUT_RDWR)
@@ -109,23 +158,7 @@ def serve_one(conn: socket.socket, ctx: ssl.SSLContext) -> None:
             return
 
 
-def main() -> int:
-    if not (os.path.exists(CERT) and os.path.exists(KEY)):
-        print(
-            f"FATAL: missing cert/key ({CERT}, {KEY}); "
-            "run scripts/generate_cert.sh first",
-            file=sys.stderr,
-            flush=True,
-        )
-        return 2
-
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(certfile=CERT, keyfile=KEY)
-
-    lsock = socket.create_server((HOST, PORT), reuse_port=False)
-    lsock.listen(8)
-    print(f"READY tlsreset {HOST}:{PORT}", flush=True)
-
+def serve(lsock: socket.socket, ctx: ssl.SSLContext) -> None:
     while True:
         conn, _ = lsock.accept()
         conn.settimeout(10.0)
@@ -136,6 +169,35 @@ def main() -> int:
                 conn.close()
             except OSError:
                 pass
+
+
+def main() -> int:
+    for path in (CERT, KEY, WRONG_CERT, WRONG_KEY):
+        if not os.path.exists(path):
+            print(
+                f"FATAL: missing {path}; run scripts/generate_cert.sh first",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=CERT, keyfile=KEY)
+    wrong_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    wrong_ctx.load_cert_chain(certfile=WRONG_CERT, keyfile=WRONG_KEY)
+
+    lsock = socket.create_server((HOST, PORT), reuse_port=False)
+    lsock.listen(8)
+    wrong_lsock = socket.create_server(
+        (HOST, WRONG_NAME_PORT), reuse_port=False
+    )
+    wrong_lsock.listen(8)
+    threading.Thread(
+        target=serve, args=(wrong_lsock, wrong_ctx), daemon=True
+    ).start()
+    print(f"READY tlsreset {HOST}:{PORT}", flush=True)
+    serve(lsock, ctx)
+    return 0
 
 
 if __name__ == "__main__":

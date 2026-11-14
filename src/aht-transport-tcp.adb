@@ -5,14 +5,28 @@ with Ada.Exceptions;
 with Ada.Real_Time; use Ada.Real_Time;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Ada.Streams; use Ada.Streams;
+with Interfaces.C;
 with GNAT.Sockets; use GNAT.Sockets;
 with AHT.DNS;
 with AHT.Transport.Waits;
 
 with AHT.Log.Tag;
 
+--  Internal GNAT units, used by Receive only: GNAT.Sockets.Thin for
+--  the recv binding and the socket error code GNAT.Sockets itself
+--  reads, System.OS_Constants for the target-generated values that
+--  code is compared against (they are implementation-defined).
+pragma Warnings (Off, "*internal GNAT unit*");
+pragma Warnings (Off, "*non-portable and version-dependent*");
+with GNAT.Sockets.Thin;
+with GNAT.Sockets.Thin_Common;
+with System.OS_Constants;
+pragma Warnings (On, "*non-portable and version-dependent*");
+pragma Warnings (On, "*internal GNAT unit*");
+
 package body AHT.Transport.TCP is
 
+   package SOSC renames System.OS_Constants;
 
 
    package Log is new AHT.Log.Tag ("tcp");
@@ -56,6 +70,55 @@ package body AHT.Transport.TCP is
          Count := Count + 1;
       end loop;
    end From_SEA;
+
+   --  One recv on the non-blocking socket, classified from the socket
+   --  error code read straight after the call. GNAT.Sockets reports a
+   --  failed receive as Socket_Error with the code only inside the
+   --  message text, so this goes to the thin binding Receive_Socket
+   --  itself calls rather than recover the code from a string.
+   type Receive_Outcome is (Received, Would_Block, Peer_Reset, Failed);
+
+   procedure Receive
+     (Self    : in out TCP_Transport;
+      Item    : out Stream_Element_Array;
+      Last    : out Stream_Element_Offset;
+      Outcome : out Receive_Outcome;
+      Error   : out Integer)
+   is
+      use type Interfaces.C.int;
+      Res : Interfaces.C.int;
+   begin
+      Res := GNAT.Sockets.Thin.C_Recv
+        (Interfaces.C.int (To_C (Self.Socket)),
+         Item'Address, Item'Length, 0);
+      if Res = GNAT.Sockets.Thin_Common.Failure then
+         Error := GNAT.Sockets.Thin.Socket_Errno;
+         Last  := Item'First - 1;
+         if Error = SOSC.EWOULDBLOCK or else Error = SOSC.EAGAIN then
+            Outcome := Would_Block;
+         elsif Error = SOSC.ECONNRESET then
+            Self.Reset_Seen := True;
+            Outcome := Peer_Reset;
+         else
+            Outcome := Failed;
+         end if;
+      else
+         Error   := 0;
+         Last    := Item'First + Stream_Element_Offset (Res) - 1;
+         Outcome := Received;
+      end if;
+   end Receive;
+
+   --  The text GNAT.Sockets puts in a Socket_Error for this code.
+   function Error_Text (Error : Integer) return String is
+      Image : constant String := Integer'Image (Error);
+   begin
+      return "[" & Image (Image'First + 1 .. Image'Last) & "] "
+        & GNAT.Sockets.Thin.Socket_Error_Message (Error);
+   end Error_Text;
+
+   function Peer_Reset (Self : TCP_Transport) return Boolean is
+     (Self.Reset_Seen);
 
    procedure Connect_Candidates
      (Self            : in out TCP_Transport;
@@ -617,30 +680,26 @@ package body AHT.Transport.TCP is
          --  selector saw readiness, which can be spurious. If the receive
          --  would block, re-park rather than erroring.
          declare
-            Would_Block : Boolean := False;
+            Outcome : Receive_Outcome;
+            Error   : Integer;
          begin
-            begin
-               Receive_Socket (Self.Socket, Buffer, Got_Last);
-            exception
-               when Ex : Socket_Error =>
-                  if Resolve_Exception (Ex)
-                    = Resource_Temporarily_Unavailable
-                  then
-                     Would_Block := True;
+            Receive (Self, Buffer, Got_Last, Outcome, Error);
+            case Outcome is
+               when Would_Block =>
+                  null;
+               when Received =>
+                  if Got_Last < Buffer'First then
+                     Last := 0;
                   else
-                     raise;
+                     From_SEA
+                       (Buffer, Buffer'First, Got_Last, Data, Count);
+                     Last := Data'First + Count - 1;
                   end if;
-            end;
-
-            if not Would_Block then
-               if Got_Last < Buffer'First then
-                  Last := 0;
-               else
-                  From_SEA (Buffer, Buffer'First, Got_Last, Data, Count);
-                  Last := Data'First + Count - 1;
-               end if;
-               return;
-            end if;
+                  return;
+               when Peer_Reset | Failed =>
+                  raise Transport_Error with
+                    "TCP read failed: " & Error_Text (Error);
+            end case;
          end;
          <<Continue_Read>>
       end loop;
@@ -679,6 +738,8 @@ package body AHT.Transport.TCP is
         (1 .. Stream_Element_Offset (Natural'Min (Data'Length, Try_Read_Max)));
       Got_Last : Stream_Element_Offset;
       Count    : Natural;
+      Outcome  : Receive_Outcome;
+      Error    : Integer;
    begin
       Last   := 0;
       Status := Would_Block;
@@ -691,20 +752,22 @@ package body AHT.Transport.TCP is
       --  Connect put the socket in non-blocking mode, so this is the
       --  receive Read_Bounded performs after its selector wake, minus
       --  the park: EAGAIN is the "nothing yet" answer, not an error.
-      Receive_Socket (Self.Socket, Buffer, Got_Last);
-      if Got_Last < Buffer'First then
-         Status := Peer_Closed;
-      else
-         From_SEA (Buffer, Buffer'First, Got_Last, Data, Count);
-         Last   := Data'First + Count - 1;
-         Status := Data_Ready;
-      end if;
-   exception
-      when E : Socket_Error =>
-         if Resolve_Exception (E) /= Resource_Temporarily_Unavailable then
+      Receive (Self, Buffer, Got_Last, Outcome, Error);
+      case Outcome is
+         when Would_Block =>
+            null;
+         when Received =>
+            if Got_Last < Buffer'First then
+               Status := Peer_Closed;
+            else
+               From_SEA (Buffer, Buffer'First, Got_Last, Data, Count);
+               Last   := Data'First + Count - 1;
+               Status := Data_Ready;
+            end if;
+         when Peer_Reset | Failed =>
             raise Transport_Error with
-              "TCP read failed: " & Ada.Exceptions.Exception_Message (E);
-         end if;
+              "TCP read failed: " & Error_Text (Error);
+      end case;
    end Try_Read;
 
    procedure Try_Write

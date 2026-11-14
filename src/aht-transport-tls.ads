@@ -170,6 +170,33 @@ package AHT.Transport.TLS is
    --  session poisoned by a fatal Read/Write reports False (via a
    --  task-safe latch, so a reader may query it while a writer fails).
 
+   type Failure_Cause is (No_Failure, Network_Reset, Other_Failure);
+
+   function Last_Failure (Self : TLS_Transport) return Failure_Cause;
+   --  What ended the session the last successful Connect established:
+   --    No_Failure     nothing has poisoned it. Not a statement about
+   --                   the last operation: a deadline, an abort, a
+   --                   close_notify and a failed Connect all leave it.
+   --    Network_Reset  the peer reset the TCP connection, and that is
+   --                   all that is known to have gone wrong: a receive
+   --                   on the socket failed with the connection-reset
+   --                   error code while the session was healthy, every
+   --                   byte received before it formed complete TLS
+   --                   records, and the engine had consumed them all.
+   --    Other_Failure  anything else that poisoned it: a record that
+   --                   failed authentication, a protocol violation, a
+   --                   stream that ended without close_notify, a
+   --                   reset that cut a record short or that a send
+   --                   discovered, an internal error.
+   --  Decided once, by the first failure, from typed state only (the
+   --  socket error code and the session's own latches), never from
+   --  an exception message. The exceptions raised are unchanged; this
+   --  says which of them a reset was. The answer is fixed from the
+   --  moment Is_Connected reports False for a fatal error and is kept
+   --  through Close, Abortive_Close and finalization of the session,
+   --  for as long as the object exists. Same precondition as
+   --  Is_Connected.
+
    overriding procedure Set_Read_Deadline
      (Self     : in out TLS_Transport;
       Deadline : Duration);
@@ -210,6 +237,10 @@ private
       --  Lifecycle-owned: written only by Connect/Close under their
       --  single-threaded preconditions. Fatal mid-session errors latch
       --  a protected flag inside Backend_State instead (RM 9.10).
+      Cause              : Failure_Cause := No_Failure;
+      --  Last_Failure's answer once State is gone: copied out of the
+      --  session's latches by Close and Abortive_Close before they
+      --  free it. While State exists the latches are read directly.
       Has_Read_Deadline  : Boolean := False;
       Read_Deadline      : Ada.Real_Time.Time := Ada.Real_Time.Time_First;
       Has_Write_Deadline : Boolean := False;

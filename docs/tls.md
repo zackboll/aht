@@ -176,6 +176,28 @@ promptly, and all network waiting happens in Ada outside the library:
   during the wait itself ends the operation only; nothing was taken
   from the socket. EOF is not a failure here: it is latched for the
   engine to classify.
+- **Failure cause.** `Last_Failure` reports `No_Failure`,
+  `Network_Reset` or `Other_Failure` for the session. The feed's
+  fail-closed path is the only place `Network_Reset` is decided, and
+  only when four typed facts hold together: the inner TCP recorded
+  the connection-reset error code on a receive (`TCP.Peer_Reset`);
+  the engine was alive; every byte received since the start of the
+  handshake formed complete TLS records (`AHT.TLS_Sync.Record_Tracker`
+  follows the record headers of the inbound ciphertext); and the
+  engine's input queue was empty. The feed runs only after an engine
+  call asked for input, so with the last two the engine holds no
+  record it has not judged. The coordinator's `Latch_Reset` then
+  records the reset only if no other failure made the session fatal
+  first. Everything else that poisons a session is `Other_Failure`:
+  a record that fails authentication, a protocol violation, a stream
+  ending without close_notify, a reset that cuts a record short, a
+  reset discovered by a send, a write deadline that fires mid-record.
+  A deadline or abort that ends only the operation, a close_notify
+  and a failed `Connect` leave `No_Failure`. No exception message is
+  consulted, and the exceptions raised are unchanged. `Close` and
+  `Abortive_Close` copy the answer into the transport object before
+  freeing the session, so it can be read for as long as the object
+  exists.
 - **Deadlines.** Both `Set_*_Deadline` budgets are mirrored as
   absolute instants computed once at the setter call. Every blocking
   step (lock seize as a timed entry call, latch wait, feed
